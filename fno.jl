@@ -1,3 +1,10 @@
+using Distributed
+
+# Add workers
+addprocs(4)
+
+@everywhere begin
+
 using ChainRulesCore
 using CUDA
 using FFTW
@@ -6,18 +13,25 @@ using MAT
 using NNlib
 using NNlibCUDA
 using OMEinsum
+using ParallelOperations
 using Parameters
 using Plots
 using Printf
 using ProgressBars
 using Random
+using Transducers
 using Zygote
 
 import Base.zero
 
+end # @everywhere (separate block for loading macros)
+
+@everywhere begin
+
 include("common.jl")
 include("restrict.jl")
 include("adam.jl")
+include("dataparallel.jl")
 
 function lift(x, Wc, Wt, bc, bt)
 
@@ -156,6 +170,8 @@ function fno_init(config::FNOConfig)
     return [Wc_in, Wt_in, bc_in, bt_in, Ds, Ws, Wc_out, bc_out], ranges
 end
 
+end # @everywhere
+
 # ==========================
 #          Training
 # ==========================
@@ -186,13 +202,9 @@ x_test  = u[:,:,:,1:1,split_idx+1:end];
 y_test  = u[:,:,:,:,split_idx+1:end];
 
 # Configure network
-device = gpu;
+device = cpu;
 config = FNOConfig(shape = [nx, ny, nt], modes = [8, 8, 8], input_dim = 1, batch_size=5);
 θ, ranges = fno_init(config);
-θ = θ |> device;
-
-# Setup optimization
-num_epochs = 20;
 
 α  = 1e-3 # Learning rate
 λ  = 1e-4 # Weight decay
@@ -201,8 +213,15 @@ num_epochs = 20;
 m  = [0.0.*p for p in θ]; # First moment vector for ADAM
 v  = [0.0.*p for p in θ]; # Second moment vector for ADAM
 
-# Relative L2 loss function
-relative_l2_loss(y, ŷ) = norm(vec(y) .- vec(ŷ))/norm(vec(y))
+# Setup optimization
+num_epochs = 20;
+
+@everywhere begin
+    # Gradient reducer
+    reduce_grads(g) = g
+    reduce_grads(g::AbstractArray{<:Number}, h::AbstractArray{<:Number}) = g .+ h
+    reduce_grads(g::AbstractArray{<:AbstractArray}, h::AbstractArray{<:AbstractArray}) = [reduce_grads(u, v) for (u, v) in zip(g, h)]
+end
 
 # Main training loop
 for epoch in 1:num_epochs
@@ -210,29 +229,35 @@ for epoch in 1:num_epochs
     # Get batch schedule
     schedule = [i:i+config.batch_size-1 for i in 1:config.batch_size:n_train]
     Random.shuffle!(schedule)
+    nbatches = length(schedule)
 
     # Training iterations
-    pbar = ProgressBar(enumerate(schedule))
-    for (i, batch) in pbar
+    pbar = ProgressBar(1:nworkers():nbatches)
+    for i in pbar
 
-        # Get training pair
-        x = view(x_train, :,:,:,:,batch) |> device;
-        y = view(y_train, :,:,:,:,batch) |> device;
+        # Get training pairs
+        xs = [view(x_train, :,:,:,:,schedule[j]) for j in i:min(i+nworkers()-1,nbatches)];
+        ys = [view(y_train, :,:,:,:,schedule[j]) for j in i:min(i+nworkers()-1,nbatches)];
 
-        # Compute gradient
-        loss = nothing
-        g = gradient(p -> begin
-            ŷ = fno(x, p..., ranges)
-            l = relative_l2_loss(y, ŷ)
-            @ignore_derivatives loss = l
-            return l
-        end, θ)[1];
+        @sca
 
-        # ADAM parameter update
-        adam_update!(θ, g, α, β1, β2, m, v, i; λ=λ)
+        # Compute local losses and pullbacks
+        @everywhere begin
+            loss, pullback = Zygote.pullback()
+        end
+        losses_and_pullbacks = pmap(pullback_producer, pairs)
+        loss = sum(map(first, losses_and_pullbacks))/nworkers()
+        pullbacks = collect(map(last, losses_and_pullbacks))
+
+        # Parameters are in third slot
+        @everywhere apply_pullback(pb) = collect(pb($loss)[3])
+
+        # Compute local gradients and sumreduce
+        foldxd(reduce_grads, Map(apply_pullback), pullbacks)
 
         set_description(pbar, string(@sprintf("epoch = %03d, batch = %03d, loss = %.4f", epoch, i, loss)))
     end
+    break
 end
 
 ŷ = fno(view(x_train, :,:,:,:,1:1) |> device, θ..., ranges) |> cpu;
