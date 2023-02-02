@@ -208,7 +208,7 @@ relative_l2_loss(y, ŷ) = norm(vec(y) .- vec(ŷ))/norm(vec(y))
 for epoch in 1:num_epochs
 
     # Get batch schedule
-    schedule = [i+1:i+config.batch_size for i in 0:config.batch_size:n_train-1]
+    schedule = [i:i+config.batch_size-1 for i in 1:config.batch_size:n_train]
     Random.shuffle!(schedule)
 
     # Training iterations
