@@ -1,14 +1,23 @@
 using ChainRulesCore
 using CUDA
 using FFTW
+using LinearAlgebra
+using MAT
 using NNlib
 using NNlibCUDA
 using OMEinsum
 using Parameters
+using Plots
+using Printf
+using ProgressBars
+using Random
 using Zygote
+
+import Base.zero
 
 include("common.jl")
 include("restrict.jl")
+include("adam.jl")
 
 function lift(x, Wc, Wt, bc, bt)
 
@@ -29,6 +38,22 @@ function lift(x, Wc, Wt, bc, bt)
 
 end
 
+function fno_rfft(x::X) where {T,X<:AbstractArray{T}}
+    n = length(size(x))
+    x = swapdims(x, 1, n-1)
+    x = rfft(x, collect(1:n-2))
+    x = swapdims(x, 1, n-1)
+    return x
+end
+
+function fno_irfft(x::X, t) where {T,X<:AbstractArray{T}}
+    n = length(size(x))
+    x = swapdims(x, 1, n-1)
+    x = irfft(x, t, collect(1:n-2))
+    x = swapdims(x, 1, n-1)
+    return x
+end
+
 function fno_block(x::X, D, W, ranges) where {T,X<:AbstractArray{T}}
 
     s = size(x)
@@ -36,37 +61,27 @@ function fno_block(x::X, D, W, ranges) where {T,X<:AbstractArray{T}}
     b = s[end]
     t = s[end-1]
     
-    # Take real FFT
-    # Have to permute so CUDA kernel doesn't complain about a discontiguous region
-    x_ft = swapdims(x, 1, n-1)
-    x_ft = rfft(x_ft, collect(1:n-1))
-    x_ft = swapdims(x_ft, 1, n-1)
+    # Forward RFFT
+    x_ft = fno_rfft(x)
     s_ft = size(x_ft)
 
-    # Restrict
-    x_ft_r = restrict(x_ft, ranges)
-
-    @show size(x_ft_r)
-
-    # Multiply with weight
+    # Restrict, weight multiply, adjoint_restrict
     (d, c, ns) = size(D)
-    x_ft_r = reshape(x_ft_r, c, ns, b)
-    y_ft_r = ein"dcn,cnb->dnb"(D, x_ft_r)
+    x_ft = restrict(x_ft, ranges)
+    x_ft = reshape(x_ft, c, ns, b)
+    y_ft = ein"dcn,cnb->dnb"(D, x_ft)
+    y_ft = restrict_adj(vec(y_ft), ranges, s_ft)
 
-    # Un-restrict
-    y_ft = restrict_adj(vec(y_ft_r), ranges, s_ft)
+    # Inverse RFFT
+    y0 = fno_irfft(y_ft, t)
 
-    # Inverse fft
-    y_ft = swapdims(y_ft, 1, n-1)
-    y_ft = irfft(y_ft, t, collect(1:n-1))
-    y1   = swapdims(y_ft, 1, n-1)
-
-    # Mix channel
+    # Passthrough weighting
     x  = as_matrix(x)
-    y2 = W*x
-    y2 = reshape(y2, s...)
+    y1 = W*x
+    y1 = reshape(y1, s...)
 
-    return gelu.(y1 .+ y2)
+    # Nonlinearity
+    return gelu.(y0 .+ y1)
 
 end
 
@@ -79,9 +94,17 @@ function proj(x, Wc, bc)
     return x
 end
 
+function fno(x, Wc_in, Wt_in, bc_in, bt_in, Ds, Ws, Wc_out, bc_out, ranges)
+    x = lift(x, Wc_in, Wt_in, bc_in, bt_in)
+    for (D, W) in zip(Ds, Ws)
+        x = fno_block(x, D, W, ranges)
+    end
+    x = proj(x, Wc_out, bc_out)
+    return x
+end
+
 @with_kw struct FNOConfig
     T = Float64
-    device = "cpu"
     shape
     modes; @assert length(modes) == length(shape)
     batch_size = 1
@@ -92,88 +115,129 @@ end
     num_blocks = 4
 end
 
-mutable struct FNOParams{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T},A<:AbstractArray{Complex{T},3}}
-    Wc_in::M
-    Wt_in::M
-    bc_in::V
-    bt_in::V
-    Ds::Vector{A}
-    Ws::Vector{M}
-    ranges::Vector
-    Wc_out::M
-    bc_out::V
+function fno_init(config::FNOConfig)
 
-    function FNOParams(config::FNOConfig)
+    # Extract type information
+    T = config.T
 
-        n = length(config.shape)
-        range_axes = [[1:config.lifted_dim]]
-        for (i, m) in enumerate(config.modes)
-            if i < n
-                s = config.shape[i]
-                push!(range_axes, [1:m, s-m+1:s])
-            else
-                push!(range_axes, [1:m])
-            end
+    # Compute ranges
+    range_axes = [[1:config.lifted_dim]]
+    for (i, m) in enumerate(config.modes)
+        if i == length(config.modes)
+            push!(range_axes, [1:m])
+        else
+            s = config.shape[i]
+            push!(range_axes, [1:m, s-m+1:s])
         end
-
-        ranges = vec(collect(Iterators.product(range_axes...)))
-        n_restrict = sum(map(rs -> prod(map(length, rs)), ranges))
-
-        namespace = Base
-        Wc_in = namespace.rand(config.T, config.lifted_dim, config.input_dim)./(config.lifted_dim*config.input_dim)
-        Wt_in = namespace.rand(config.T, config.shape[end], config.timesteps_in)./(config.shape[end]*config.timesteps_in)
-        bc_in = namespace.zeros(config.T, config.lifted_dim)
-        bt_in = namespace.zeros(config.T, config.shape[end])
-        Ds = [
-            namespace.rand(
-                Complex{config.T},
-                config.lifted_dim,
-                config.lifted_dim,
-                n_restrict ÷ config.lifted_dim
-            )./(config.lifted_dim*config.lifted_dim)
-        for _ in 1:config.num_blocks]
-        Ws = [
-            namespace.rand(
-                config.T,
-                config.lifted_dim,
-                config.lifted_dim
-            )./(config.lifted_dim*config.lifted_dim)
-        for _ in 1:config.num_blocks]
-        Wc_out = namespace.rand(config.T, config.output_dim, config.lifted_dim)./(config.output_dim*config.lifted_dim)
-        bc_out = namespace.zeros(config.T, config.output_dim)
-
-        return new{config.T,typeof(Wc_in),typeof(bc_in),typeof(Ds[1])}(
-            Wc_in,
-            Wt_in,
-            bc_in,
-            bt_in,
-            Ds,
-            Ws,
-            ranges,
-            Wc_out,
-            bc_out
-        )
     end
+    push!(range_axes, [1:config.batch_size])
+    ranges = vec(collect(Iterators.product(range_axes...)))
 
-    function FNOParams(args...)
-        T = eltype(args[1])
-        M = typeof(args[1])
-        V = typeof(args[3])
-        A = typeof(args[5][1])
-        return new{T,M,V,A}(args...)
+    # Extract shape information
+    d_in   = config.input_dim
+    d_lift = config.lifted_dim
+    d_out  = config.output_dim
+    t_in   = config.timesteps_in
+    t_out  = config.shape[end]
+    n_res  = sum([prod(map(length, rs[1:end-1])) for rs in ranges])
+
+    # Initialize weights
+    Wc_in = rand(T, d_lift, d_in)./sqrt(d_lift*d_in)
+    Wt_in = rand(T, t_out, t_in)./sqrt(t_out*t_in)
+    bc_in = zeros(T, d_lift)
+    bt_in = zeros(T, t_out)
+
+    Ds = [rand(Complex{T}, d_lift, d_lift, n_res÷d_lift)./(d_lift^2) for _ in 1:config.num_blocks]
+    Ws = [rand(T, d_lift, d_lift)./(d_lift^2) for _ in 1:config.num_blocks]
+
+    Wc_out = rand(T, d_out, d_lift)./sqrt(d_out*d_lift)
+    bc_out = zeros(T, d_out)
+
+    return [Wc_in, Wt_in, bc_in, bt_in, Ds, Ws, Wc_out, bc_out], ranges
+end
+
+# ==========================
+#          Training
+# ==========================
+
+# Reproducibility
+Random.seed!(1337)
+
+# Load data
+data_path = joinpath(homedir(), "data/NavierStokes_V1e-5_N1200_T20.mat");
+u = Float64.(matread(data_path)["u"]);
+
+# Reshape data
+subsample = 1
+u = permutedims(u, (2, 3, 4, 1));
+u = u[1:subsample:end,1:subsample:end,:,:];
+(nx, ny, nt, nb) = size(u);
+u = reshape(u, 1, nx, ny, nt, nb);
+
+# Separate training data
+train_split = 0.8;
+split_idx = Int(round(train_split*nb));
+n_train = split_idx
+n_test  = nb - n_train
+
+x_train = u[:,:,:,1:1,1:split_idx];
+y_train = u[:,:,:,:,1:split_idx];
+x_test  = u[:,:,:,1:1,split_idx+1:end];
+y_test  = u[:,:,:,:,split_idx+1:end];
+
+# Configure network
+device = gpu;
+config = FNOConfig(shape = [nx, ny, nt], modes = [8, 8, 8], input_dim = 1, batch_size=5);
+θ, ranges = fno_init(config);
+θ = θ |> device;
+
+# Setup optimization
+num_epochs = 20;
+
+α  = 1e-3 # Learning rate
+λ  = 1e-4 # Weight decay
+β1 = 0.9   # First ADAM decay parameter
+β2 = 0.999 # Second ADAM decay parameter
+m  = [0.0.*p for p in θ]; # First moment vector for ADAM
+v  = [0.0.*p for p in θ]; # Second moment vector for ADAM
+
+# Relative L2 loss function
+relative_l2_loss(y, ŷ) = norm(vec(y) .- vec(ŷ))/norm(vec(y))
+
+# Main training loop
+for epoch in 1:num_epochs
+
+    # Get batch schedule
+    schedule = [i+1:i+config.batch_size for i in 0:config.batch_size:n_train-1]
+    Random.shuffle!(schedule)
+
+    # Training iterations
+    pbar = ProgressBar(enumerate(schedule))
+    for (i, batch) in pbar
+
+        # Get training pair
+        x = view(x_train, :,:,:,:,batch) |> device;
+        y = view(y_train, :,:,:,:,batch) |> device;
+
+        # Compute gradient
+        loss = nothing
+        g = gradient(p -> begin
+            ŷ = fno(x, p..., ranges)
+            l = relative_l2_loss(y, ŷ)
+            @ignore_derivatives loss = l
+            return l
+        end, θ)[1];
+
+        # ADAM parameter update
+        adam_update!(θ, g, α, β1, β2, m, v, i; λ=λ)
+
+        set_description(pbar, string(@sprintf("epoch = %03d, batch = %03d, loss = %.4f", epoch, i, loss)))
     end
 end
 
-function fno(x::X, params::FNOParams{T,M,V,A}) where {T,X<:AbstractArray{T},M,V,A}
-    x = lift(x, params.Wc_in, params.Wt_in, params.bc_in, params.bc_out)
-    for (D, W) in zip(params.Ds, params.Ws)
-        x = fno_block(x, D, W, params.ranges)
-    end
-    x = proj(x, params.Wc_out, params.bc_out)
-    return x
-end
-
-config = FNOConfig(shape = [64, 64, 20], modes = [8, 8, 8])
-params = FNOParams(config) |> gpu;
-x = rand(config.input_dim, config.shape[1:end-1]..., config.timesteps_in, config.batch_size)
-y = fno(x, params) |> gpu
+ŷ = fno(view(x_train, :,:,:,:,1:1) |> device, θ..., ranges) |> cpu;
+clim = (minimum(ŷ)-0.05, maximum(ŷ)+0.05)
+anim = @animate for i in 1:nt
+    heatmap(ŷ[1,:,:,i,1]; clim=clim)
+end;
+gif(anim, "out.gif", fps=5);

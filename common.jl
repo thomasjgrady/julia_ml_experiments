@@ -25,24 +25,15 @@ function as_matrix(x)
     return reshape(x, s[1], prod(s[2:end]))
 end
 
+function rotate_dims(x, m)
+    n = length(size(x))
+    return permutedims(x, circshift(collect(1:n), m))
+end
+
 cpu(x::AbstractArray{<:Number}) = x
 cpu(x::CuArray{<:Number}) = Array(x)
 cpu(x::AbstractArray{<:AbstractArray}) = cpu.(x)
 
-macro _cpu_helper(x)
-    quote
-        $(Base.typename(typeof($x)).wrapper)([cpu(getfield($x, i)) for i in 1:fieldcount($x)]...)
-    end
-end
-cpu(x) = @_cpu_helper x
-
 gpu(x::AbstractArray{<:Number}) = CuArray(x)
 gpu(x::CuArray{<:Number}) = x
 gpu(x::AbstractArray{<:AbstractArray}) = gpu.(x)
-
-macro _gpu_helper(x)
-    quote
-        $(Base.typename(typeof($x)).wrapper)([gpu(getfield($x, i)) for i in 1:fieldcount($x)]...)
-    end
-end
-gpu(x) = @_gpu_helper x
